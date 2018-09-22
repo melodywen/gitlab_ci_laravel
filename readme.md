@@ -39,7 +39,23 @@ runner的注册的元素有以下部分： ( 具体的操作请看出 [参考文
 2. 不能直接修改配置文件来创建runner：
     * 因为它会发送请求给gitlab， 让他们建立连接；
     * 配置文件`.toml` 只是记录runner 的配置信息而已
-2. 快捷注册：
+3. 快捷注册：
     ```
     gitlab-runner register -u http://192.168.33.10/ -r jtvLcjb7EjksR7eLMZNQ  --executor docker --docker-image ubuntu:16.04  -c /etc/gitlab-runner/config-1.toml
     ```
+
+**总结： 创建runner的时候个人建议是根据实际需求，把需要的异步执行的runner 分别创建在不同的配置文件下面， 因为后面会用得到（不同的配置文件应用于不同的service 中，这样可以达到 runner之间异步执行的效果）**
+
+### 2.2 创建一个service， 并且运行它
+首先注册一个runner 运行的service ，并且附带使用哪个配置文件、哪个用户、并且service 的名称 
+```
+gitlab-runner install  \
+    --service gitlab-runner-1 \
+    --config /etc/gitlab-runner/config-1.toml \
+    --user root
+```
+
+其他部分（对服务器的重启、关闭等等执行查看手册）：
+```
+gitlab-runner -h
+```
