@@ -1,0 +1,252 @@
+image: registry.cn-beijing.aliyuncs.com/gitlab_ci/laravel-ci-php7.1:1.0.1
+services:
+  - mysql:5.7
+  - redis:4.0.9
+
+variables:
+  GIT_STRATEGY: none                            # git策略， 全局关闭 自动拉去代码1
+  SSH_ID_RSA: none                              # 服务器的私钥      —— 用来拉去远程服务器的代码的
+  SSH_ID_RSA_PUB: none                          # 服务器的公钥
+
+  # 项目信息
+  PROJECT_URL_OF_SSH: git@192.168.33.10:laravel-group/test-project.git
+  PROJECT_GROUP: laravel-group
+  PROJECT_NAME: test-project
+  PROJECT_URL: www.laravel.com
+  PROJECT_PHP_VERSION: '7.1'
+  WEBHOOK: https://oapi.dingtalk.com/robot/send?access_token=fd095226095006c42cf7e281b8b8376f1826ed4d7cc2d23e03e451e1ca7c8d9f
+
+  # 数据库信息
+  DB_HOST: mysql
+  DB_USERNAME: root
+  MYSQL_ROOT_PASSWORD: 123456
+  MYSQL_DATABASE: laravel
+
+  # 公测、内测 服务器
+  PRIVATE_SERVER_ADDRESS: root@172.17.0.2
+  PUBLIC_SERVER_ADDRESS: root@172.17.0.2
+
+  # 公测.env 文件
+  ENV_DB_HOST: 127.0.0.1
+  ENV_DB_DATABASE: laravel
+  ENV_DB_USERNAME: mysql
+  ENV_DB_PASSWORD: 123456
+
+before_script:
+  # 加载环境变量
+  - source ~/.bash_profile
+  # 启动 ssh 服务器
+  - /etc/init.d/ssh start
+  # 启动其他的基础服务
+  - /etc/init.d/nginx start
+  - /etc/init.d/php$PROJECT_PHP_VERSION-fpm start
+  # 查看hostname
+  - hostname
+  - cat ~/.ssh/id_rsa
+  - cat ~/.ssh/id_rsa.pub
+  - cat ~/bin/composer-project/Envoy.blade.php
+
+stages:
+  - build
+  - test
+  - deploy
+  - failure
+  - success
+
+build_project:
+  stage: build
+  script:
+    # 查看php 内存设置
+    - php -r "echo ini_get('memory_limit').PHP_EOL;"
+    - cd /build/www && ls . && rm -rf $PROJECT_NAME
+    # 克隆指定的分支： 分支名称为：$CI_COMMIT_REF_NAME， ssh地址为：$PROJECT_URL_OF_SSH
+    - git clone --branch $CI_COMMIT_REF_NAME $PROJECT_URL_OF_SSH --recursive
+    - cd $PROJECT_NAME
+    - composer install
+    - cp .env.testing .env
+    - php artisan key:gen
+    - php artisan key:gen --env=testing
+    - ls .
+  only:
+    - master
+    - dev
+  tags:
+    - build
+
+test_project:
+  stage: test
+  script:
+    - cd /root/bin/composer-project
+    #################################################################
+    # 第一部分 配置web 环境 1. 使用 php7.1 ； 2. 开启php错误日志；3. 建立nginx 站点
+    #################################################################
+    - echo "127.0.0.1 $PROJECT_URL" >> /etc/hosts               # 配置 host
+    - envoy run task-php-type-change-fastcgi --php_version=php$PROJECT_PHP_VERSION
+    - envoy run task-php-display_errors-on --php_version=php$PROJECT_PHP_VERSION
+    - envoy run task-nginx-site-add  --php_fpm=php$PROJECT_PHP_VERSION --project_name=$PROJECT_NAME --host=$PROJECT_URL --root_dir=/build/www --php_type=FastCGI
+    ###############################################################
+    # 第二部分 配置项目详细 （redis mysql 是不做数据持久化的，用完就被删除）
+    ###############################################################
+    - cd /build/www/$PROJECT_NAME
+    - chmod -R 777 storage bootstrap
+    - php artisan migrate --seed
+    ###############################################################
+    # 第三部分 开始测试 (默认使用 .env.testing)
+    ###############################################################
+    - ./vendor/bin/phpcs --standard=PSR1,PSR2,PSR12 --colors -p app/ routes/ config/
+
+    - ./vendor/bin/phpunit
+    - php artisan config:cache
+    - php artisan route:cache
+    - composer install --optimize-autoloader
+  tags:
+    - test
+  only:
+    - master
+    - dev
+
+deploay-staging:
+  stage: deploy
+  script:
+    # 登录远程服务器
+    - ssh -o StrictHostKeyChecking=no $PRIVATE_SERVER_ADDRESS << EOF
+    - set -e
+    - if [ ! -d "/var/www/$PROJECT_NAME" ]; then
+    -     cd /var/www && git clone --branch $CI_COMMIT_REF_NAME $PROJECT_URL_OF_SSH --recursive
+    - fi;
+    - cd /var/www/$PROJECT_NAME
+    # 拉去分支代码
+    - git checkout $CI_COMMIT_REF_NAME
+    - git pull origin $CI_COMMIT_REF_NAME
+    - git submodule foreach git checkout $CI_COMMIT_REF_NAME
+    - git submodule foreach git pull origin $CI_COMMIT_REF_NAME
+    # composer 操作
+    - composer install --optimize-autoloader
+    # 权限操作
+    - chmod -R 775 storage bootstrap
+    - chown -R www-data storage bootstrap
+    # artisan 命令操作
+    - php artisan migrate
+    - php artisan db:seed
+    - php artisan config:cache
+    - php artisan route:cache
+
+    - EOF
+  environment:
+    name: staging
+    url: https://staging.example.com
+  tags:
+      - deploy
+  only:
+    - dev
+
+deploay-production:
+  stage: deploy
+  script:
+    # 首先查看本地是否存在备份 的目录，没有则新建
+    - if [ ! -d "/build/backups/$PROJECT_NAME" ]; then mkdir -p /build/backups/$PROJECT_NAME; fi;
+    - cd /build/backups/$PROJECT_NAME
+    # 查看备份的文件夹下面有没有存在的备份项目文件, 如果没有则进行构建(构建生产环境项目)
+    - if [ ! -f "$PROJECT_NAME-$CI_COMMIT_SHA.tar.gz" ]; then
+    -     ls .
+          # 打包一份生产环境的代码
+    -     rm -rf $PROJECT_NAME
+    -     git clone --branch $CI_COMMIT_REF_NAME $PROJECT_URL_OF_SSH --recursive
+    -     cd $PROJECT_NAME
+    -     composer install  --no-dev --optimize-autoloader
+    -     cp .env.example .env
+    -     php artisan key:gen
+
+          # 修改.env 文件
+    -     sed -i "s/\(APP_DEBUG=\).*/\1false/" .env
+    -     sed -i "s/\(APP_ENV=\).*/\1production/" .env
+    -     sed -i "s/\(DB_HOST=\).*/\1$ENV_DB_HOST/" .env
+    -     sed -i "s/\(DB_DATABASE=\).*/\1$ENV_DB_DATABASE/" .env
+    -     sed -i "s/\(DB_USERNAME=\).*/\1$ENV_DB_USERNAME/" .env
+    -     sed -i "s/\(DB_PASSWORD=\).*/\1$ENV_DB_PASSWORD/" .env
+    -     cat .env
+
+          # 开始打包文件
+    -     cd .. && mv $PROJECT_NAME $PROJECT_NAME-$CI_COMMIT_SHA
+    -     tar -zcf $PROJECT_NAME-$CI_COMMIT_SHA.tar.gz $PROJECT_NAME-$CI_COMMIT_SHA
+    -     rm -rf $PROJECT_NAME-$CI_COMMIT_SHA
+
+          # 值保留最新的5个版本，移除最老的版本
+    -     if [ $(ls -lR| grep "^-" | wc -l) -gt 5 ]; then
+    -         echo "将移除下面两个老文件"
+    -         ls -rt | head -n2
+              # 删除最老的两个版本，最后都会稳定在（4-5个文件）
+    -         rm -rf $(ls -rt | head -n2)
+    -     fi
+    - fi
+
+    # 开始远程部署项目
+    - scp -o StrictHostKeyChecking=no $PROJECT_NAME-$CI_COMMIT_SHA.tar.gz $PUBLIC_SERVER_ADDRESS:/var/www
+    - ssh -o StrictHostKeyChecking=no $PUBLIC_SERVER_ADDRESS << EOF
+    - set -e
+    - cd /var/www
+    - tar zxf $PROJECT_NAME-$CI_COMMIT_SHA.tar.gz
+    # 如果存在老项目则迁移对应的 storage 缓存文件 （主要是log日志）
+    - if [ -d "$PROJECT_NAME" ]; then
+    -     cp -r $PROJECT_NAME/storage/* $PROJECT_NAME-$CI_COMMIT_SHA/storage
+    - fi
+    # 做数据迁移和缓存以及权限
+    - cd $PROJECT_NAME-$CI_COMMIT_SHA
+    - chmod -R 775 storage bootstrap
+    - chown -R www-data storage bootstrap
+    - php artisan route:cache
+    - php artisan config:cache
+    - php artisan migrate
+    # 开始对老的项目进行覆盖操作
+    - cd /var/www
+    - rm -rf $PROJECT_NAME-old
+    - if [ -d "$PROJECT_NAME" ]; then
+    -     mv $PROJECT_NAME $PROJECT_NAME-old
+    - fi
+    - mv $PROJECT_NAME-$CI_COMMIT_SHA $PROJECT_NAME
+    - rm -rf $PROJECT_NAME-$CI_COMMIT_SHA.tar.gz
+    - EOF
+  environment:
+    name: production
+    url: https://production.example.com
+  tags:
+      - production
+  when: manual
+  allow_failure: false
+  only:
+    - master
+
+success:
+  stage: success
+  script:
+    - curl -l  -H "Content-type:application/json" -X POST -d \
+      "{
+        \"msgtype\":\"markdown\",
+          \"markdown\":{
+              \"title\":\"项目gitlab-ci集成 success ^_^ \",
+              \"text\":\"## 项目gitlab-ci集成 success ^_^ \n > 项目名称：$PROJECT_GROUP / $PROJECT_NAME \n\n > 分支信息：$CI_COMMIT_REF_NAME \n\n > 版本信息： $CI_COMMIT_SHA \n\n > 提交信息：$CI_COMMIT_MESSAGE \n\n \"
+          }
+      }" $WEBHOOK
+  when: on_success
+  tags:
+    - notice
+
+failure:
+  stage: failure
+  script:
+    - curl -l  -H "Content-type:application/json" -X POST -d \
+      "{
+        \"msgtype\":\"markdown\",
+          \"markdown\":{
+              \"title\":\"项目gitlab-ci集成 error 0.0 \",
+              \"text\":\"## 项目gitlab-ci集成 error 0.0 \n > 项目名称：$PROJECT_GROUP / $PROJECT_NAME \n\n > 分支信息：$CI_COMMIT_REF_NAME \n\n > 版本信息： $CI_COMMIT_SHA \n\n > 提交信息：$CI_COMMIT_MESSAGE \n\n \"
+          }
+      }" $WEBHOOK
+  when: on_failure
+  tags:
+    - notice
+
+after_script:
+  - cat /var/log/nginx/*
+  - cat /var/log/php*
+  - cat /build/root/$PROJECT_NAME/storage/logs/*
