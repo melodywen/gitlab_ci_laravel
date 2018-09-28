@@ -193,12 +193,10 @@ deploay-production:
     - if [ -d "$PROJECT_NAME" ]; then
     -     cp -r $PROJECT_NAME/storage/* $PROJECT_NAME-$CI_COMMIT_SHA/storage
     - fi
-    # 做数据迁移和缓存以及权限
+    # 做数据迁移以及权限
     - cd $PROJECT_NAME-$CI_COMMIT_SHA
     - chmod -R 775 storage bootstrap
     - chown -R www-data storage bootstrap
-    - php artisan route:cache
-    - php artisan config:cache
     - php artisan migrate
     # 开始对老的项目进行覆盖操作
     - cd /var/www
@@ -208,6 +206,10 @@ deploay-production:
     - fi
     - mv $PROJECT_NAME-$CI_COMMIT_SHA $PROJECT_NAME
     - rm -rf $PROJECT_NAME-$CI_COMMIT_SHA.tar.gz
+    # 做文件缓存
+    - cd $PROJECT_NAME
+    - php artisan route:cache
+    - php artisan config:cache
     - EOF
   environment:
     name: production
