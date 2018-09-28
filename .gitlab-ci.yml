@@ -1,4 +1,4 @@
-image: registry.cn-beijing.aliyuncs.com/gitlab_ci/laravel-ci-php7.1:1.0.1
+image: registry.cn-beijing.aliyuncs.com/gitlab_ci/laravel-ci-php7.1:1.0.2
 services:
   - mysql:5.7
   - redis:4.0.9
